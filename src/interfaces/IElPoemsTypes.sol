@@ -22,9 +22,9 @@ interface IElPoemsTypes {
     address content;
     address createdBy;
     address friend;
-    uint256 createdAt;
+    uint256 finishedAt;
     Stage stage;
-    uint256[3] finalMaterials;
+    uint256[2] finalMaterials;
     uint256 transferedMaterial;
   }
 }

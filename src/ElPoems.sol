@@ -3,10 +3,10 @@ pragma solidity 0.8.20;
 
 import {Ownable} from "solady/src/auth/Ownable.sol";
 import {SSTORE2} from "solady/src/utils/SSTORE2.sol";
-import {LibPRNG} from "solady/src/utils/LibPRNG.sol";
+import {LibString} from "solady/src/utils/LibString.sol";
 
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ERC721} from "openzeppelin-contracts/contracts/token/ERC721/ERC721.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 
 import {ElPoemsSourceMaterial} from "./ElPoemsSourceMaterial.sol";
 
@@ -14,14 +14,14 @@ import {IElPoemsMetadataRenderer} from "./interfaces/IElPoemsMetadataRenderer.so
 import {IElPoemsTypes} from "./interfaces/IElPoemsTypes.sol";
 import {IElPoems} from "./interfaces/IElPoems.sol";
 
+
 // @author El
 contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
-  using LibPRNG for LibPRNG.PRNG;
 
   uint256 private _tokenId;
 
-  uint256 public constant POEMS_MAX_SUPPLY = 250;
-  uint256 public constant POEMS_MINT_PRICE = 0.003 ether;
+  uint256 public constant POEMS_MAX_SUPPLY = 200;
+  uint256 public constant POEMS_MINT_PRICE = 0.011 ether;
 
 
   ElPoemsSourceMaterial public sourceMaterial;
@@ -31,6 +31,10 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
   mapping(address minter => uint256 tokenId) private _hasPoem; // 1 poem by wallet
   mapping(address minter => uint256[] ids) private _materials;
 
+  bool public openMint;
+
+  receive() external payable {}
+  fallback() external payable {}
 
   constructor(IElPoemsMetadataRenderer _metadataRenderer, ElPoemsSourceMaterial _sourceMaterial) ERC721("EL POEMS", "ELP") {
     metadataRenderer = _metadataRenderer;
@@ -39,18 +43,13 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
     _initializeOwner(msg.sender);
   }
 
-  function mintSourceMaterial() external {
-
+  function mintSourceMaterial() external payable nonReentrant {
+    if (!openMint) revert MintNotOpen();
     if (_tokenId == POEMS_MAX_SUPPLY) revert NoSupplyLeft();
-
-    if (sourceMaterial.nextTokenId() == 1) {
-      _mintSourceMaterial(msg.sender, 3);
-    } else {
-      if (sourceMaterial.balanceOf(msg.sender) != 1) revert CannotMintMaterial();
-      if (_hasPoem[msg.sender] > 0) revert AlreadyHasPoem();
-
-      _mintSourceMaterial(msg.sender, 2);
-    }
+    if (msg.value != POEMS_MINT_PRICE) revert WrongPrice();
+    if (sourceMaterial.balanceOf(msg.sender) != 1) revert CannotMintMaterial();
+    
+    _mintSourceMaterial(msg.sender, 2);
   }
 
   //tokenId -> material being transfered
@@ -64,16 +63,15 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
 
     if (sourceMaterial.ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
     if (poem.stage >= Stage.TransferedMaterial) revert SourceMaterialAlreadyTransfered();
-    if (_hasPoem[to] > 0) revert AlreadyHasPoem();
     if (sourceMaterial.balanceOf(to) > 0) revert AlreadyHasMaterial();
-    if (msg.sender == to) revert CannotTransferToYourself();
+    if (_hasPoem[to] > 0) revert AlreadyHasPoem();
 
     poem.stage = Stage.TransferedMaterial;
     poem.transferedMaterial = tokenId; 
 
     if (_tokenId == POEMS_MAX_SUPPLY) {
       to = address(0);
-      _burn(tokenId);
+      sourceMaterial.burn(tokenId);
     } else {
 
       _materials[to].push(tokenId);
@@ -90,8 +88,9 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
 
     ElPoem storage poem = _elPoems[poemId];
 
+    if (poem.stage < Stage.TransferedMaterial) revert TransferSourceMaterialFirst();
     if (poem.stage >= Stage.PersonalAdded) revert PersonalContentAlreadyAdded();
-    if(bytes(content).length < 50 || bytes(content).length > 300) revert ContentNotInLenRange();
+    if (LibString.runeCount(content) < 20 || LibString.runeCount(content) > 200) revert ContentNotInLenRange();
 
     poem.content = SSTORE2.write(bytes(content));
     poem.stage = Stage.PersonalAdded;
@@ -102,23 +101,28 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
   function finishPoem(uint256 tokenId, string calldata title) external {
     ElPoem storage poem = _elPoems[tokenId];
 
-    if (poem.stage == Stage.Finished) revert PoemAlreadyFinished();
     if (msg.sender != poem.friend) revert NotPoemFriend();
+    if (poem.stage == Stage.Finished) revert PoemAlreadyFinished();
 
     poem.title = title;
+    poem.stage = Stage.Finished;
+    poem.finishedAt = block.timestamp;
 
-    //REMIX, REMIX, REMIX HOW????
-
+    uint256 count;
     for (uint256 i; i < 3; i++) {
       uint256 materialId = _materials[poem.createdBy][i];
 
       if (materialId != poem.transferedMaterial) {
-        poem.finalMaterials[i] = materialId;
+        poem.finalMaterials[count] = materialId;
+        count++;
+
+        sourceMaterial.burn(materialId);
       }
     }
 
     delete _materials[poem.createdBy];
 
+    emit PoemFinished({ tokenId: tokenId });
   }
 
   function setFriend(address friend) external {
@@ -128,22 +132,47 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
 
     ElPoem storage poem = _elPoems[poemId];
 
-    if (msg.sender != poem.createdBy) revert NotPoemCreator();
+    if (poem.stage < Stage.PersonalAdded) revert AddPersonalContentFirst();
     if (poem.stage == Stage.Finished) revert PoemAlreadyFinished();
     if (friend == address(0)) revert AddressCannotBeZero();
+    if (friend == msg.sender) revert FriendCannotBeYourself();
 
     poem.friend = friend;
 
-    emit FriendAdded();
+    emit FriendAdded({
+      tokenId: poemId,
+      friend: friend
+    });
   }
 
   function tokenURI(uint256 tokenId) public view override returns(string memory) {
     return metadataRenderer.tokenURI(tokenId, _elPoems[tokenId]);
   }
 
-  function withdrawAll() external payable onlyOwner nonReentrant {
-    (bool sent, ) = payable(msg.sender).call{value: msg.value}("");
-    require(sent, "Error when withdrawing the balance sheet");
+  function elPoemDetails(uint256 tokenId) external view returns (ElPoem memory) {
+    return _elPoems[tokenId];
+  }
+
+  function elPoemId(address creator) external view returns (uint256) {
+    return _hasPoem[creator];
+  }
+
+  function withdraw(address to) external onlyOwner {
+    (bool success, ) = to.call{value: address(this).balance}("");
+    require(success, "Withdraw failed");
+  }
+
+  function updateMetadataRenderer(IElPoemsMetadataRenderer newRenderer) external onlyOwner {
+    metadataRenderer = newRenderer;
+  }
+
+  function updateSourceMaterial(ElPoemsSourceMaterial newSourceMaterial) external onlyOwner {
+    sourceMaterial = newSourceMaterial;
+  }
+
+  function ownerMint() external onlyOwner {
+    openMint = true;
+    _mintSourceMaterial(msg.sender, 3);
   }
 
   function _mintSourceMaterial(address to, uint256 quantity) internal {
@@ -162,21 +191,21 @@ contract ElPoems is IElPoems, IElPoemsTypes, ERC721, Ownable, ReentrancyGuard {
     }
 
     _mint(to, _tokenId);
+
+    emit SourceMaterialMinted({ lastTokenId: lastMinted });
   }
 
-  function elPoemDetails(uint256 tokenId) external view returns (ElPoem memory) {
-    return _elPoems[tokenId];
-  }
 
-  function elPoemId(address creator) external view returns (uint256) {
-    return _hasPoem[creator];
-  }
+  /* CANNOT TRANSFER UNFINISHED POEM */
 
-  //CANNOT TRANSFER UNFINISHED POEM
-  function _update(address to, uint256 tokenId, address auth) internal virtual override returns (address) {
-
-    //if (_elPoems[tokenId].stage != Stage.Finished) revert CannotTransferUnfinishedPoem();
-
-    super._update(to, tokenId, auth);
+  function _beforeTokenTransfer(
+    address from, 
+    address /*to*/, 
+    uint256 /*firstTokenId*/, 
+    uint256 /*batchSize*/
+  ) internal override {
+    if (from != address(0)) {
+      if (_elPoems[_hasPoem[from]].stage != Stage.Finished) revert CannotTransferUnfinishedPoem();
+    }
   }
 }
